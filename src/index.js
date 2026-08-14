@@ -3,8 +3,8 @@ const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const { PrismaPg } = require('@prisma/adapter-pg');
 const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken'); // NEW: JWT import
 
-// Prisma 7 Adapter Setup
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 const app = express();
@@ -21,7 +21,7 @@ app.get('/api/status', async (req, res) => {
     }
 });
 
-// 2. User Registration (Enforces absolute zero baseline)
+// 2. User Registration
 app.post('/api/register', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -29,11 +29,9 @@ app.post('/api/register', async (req, res) => {
 
         const user = await prisma.user.create({
             data: {
-                email: email,
+                email,
                 passwordHash: hashedPassword,
-                portfolios: {
-                    create: { assetType: 'FIAT', assetSymbol: 'KES', balance: 0.0 }
-                }
+                portfolios: { create: { assetType: 'FIAT', assetSymbol: 'KES', balance: 0.0 } }
             },
             include: { portfolios: true }
         });
@@ -43,7 +41,33 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// 3. Process Deposit (Atomic ledger & balance update)
+// NEW: 3. User Login & Token Generation
+app.post('/api/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        
+        // Find the user
+        const user = await prisma.user.findUnique({ where: { email } });
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        // Verify the password using bcrypt
+        const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
+        if (!isPasswordValid) return res.status(401).json({ error: 'Invalid credentials' });
+
+        // Generate the JWT key (valid for 1 hour)
+        const token = jwt.sign(
+            { userId: user.id, email: user.email }, 
+            process.env.JWT_SECRET, 
+            { expiresIn: '1h' }
+        );
+
+        res.json({ status: 'Success', message: 'Login successful', token });
+    } catch (error) {
+        res.status(500).json({ error: 'Login failed.' });
+    }
+});
+
+// 4. Process Deposit
 app.post('/api/deposit', async (req, res) => {
     try {
         const { email, amount, assetSymbol } = req.body;
@@ -68,7 +92,7 @@ app.post('/api/deposit', async (req, res) => {
     }
 });
 
-// 4. Process Withdrawal (Strict boundary checks)
+// 5. Process Withdrawal
 app.post('/api/withdraw', async (req, res) => {
     try {
         const { email, amount, assetSymbol } = req.body;
@@ -79,7 +103,6 @@ app.post('/api/withdraw', async (req, res) => {
 
         const portfolio = user.portfolios.find(p => p.assetSymbol === assetSymbol);
         
-        // Strict Zero-Baseline Verification
         if (!portfolio || portfolio.balance < amount) {
             return res.status(400).json({ error: 'Insufficient funds. Strict zero-baseline enforced.' });
         }
@@ -99,15 +122,12 @@ app.post('/api/withdraw', async (req, res) => {
     }
 });
 
-// 5. Internal Asset Swap (Interactive Transaction with timeout limits adjusted for cloud latency)
+// 6. Internal Asset Swap
 app.post('/api/swap', async (req, res) => {
     try {
         const { email, fromAsset, toAsset, amountToSwap } = req.body;
-        
-        // Mock Exchange Rate
         const MOCK_EXCHANGE_RATES = { 'KES_TO_SOL': 1 / 20000, 'SOL_TO_KES': 20000 };
-        const rateKey = `${fromAsset}_TO_${toAsset}`;
-        const rate = MOCK_EXCHANGE_RATES[rateKey];
+        const rate = MOCK_EXCHANGE_RATES[`${fromAsset}_TO_${toAsset}`];
 
         if (!rate) return res.status(400).json({ error: 'Trading pair not supported.' });
         if (amountToSwap <= 0) return res.status(400).json({ error: 'Swap amount must be greater than zero' });
@@ -123,7 +143,6 @@ app.post('/api/swap', async (req, res) => {
                 throw new Error(`Insufficient ${fromAsset} balance for swap.`);
             }
 
-            // Deduct 'from' asset
             await tx.portfolio.update({
                 where: { userId_assetSymbol: { userId: user.id, assetSymbol: fromAsset } },
                 data: { balance: { decrement: amountToSwap } }
@@ -132,7 +151,6 @@ app.post('/api/swap', async (req, res) => {
                 data: { userId: user.id, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -amountToSwap }
             });
 
-            // Add 'to' asset
             const toPortfolio = await tx.portfolio.upsert({
                 where: { userId_assetSymbol: { userId: user.id, assetSymbol: toAsset } },
                 update: { balance: { increment: amountToReceive } },
@@ -143,24 +161,15 @@ app.post('/api/swap', async (req, res) => {
             });
 
             return { toPortfolio, amountToReceive };
-        }, 
-        {
-            maxWait: 10000, // 10 seconds max wait
-            timeout: 20000  // 20 seconds max execution
-        });
+        }, { maxWait: 10000, timeout: 20000 });
 
-        res.json({
-            status: 'Success',
-            message: `Swapped ${amountToSwap} ${fromAsset} for ${swapResult.amountToReceive} ${toAsset}.`,
-            newBalance: swapResult.toPortfolio
-        });
-
+        res.json({ status: 'Success', message: `Swapped ${amountToSwap} ${fromAsset} for ${swapResult.amountToReceive} ${toAsset}.`, newBalance: swapResult.toPortfolio });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Swap failed.' });
     }
 });
 
-// 6. Fetch Full Dashboard
+// 7. Fetch Full Dashboard
 app.get('/api/dashboard/:email', async (req, res) => {
     try {
         const { email } = req.params;
