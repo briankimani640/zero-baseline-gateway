@@ -3,13 +3,31 @@ const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const { PrismaPg } = require('@prisma/adapter-pg');
 const bcrypt = require('bcrypt');
-const jwt = require('jsonwebtoken'); // NEW: JWT import
+const jwt = require('jsonwebtoken');
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 const app = express();
 
 app.use(express.json());
+
+// --- MIDDLEWARE ---
+// This function protects our routes by requiring a valid JWT token
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Extracts token from "Bearer <token>"
+
+    if (!token) return res.status(401).json({ error: 'Access denied. No token provided.' });
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, decodedUser) => {
+        if (err) return res.status(403).json({ error: 'Invalid or expired token.' });
+        
+        req.user = decodedUser; // Attach the decoded payload to the request
+        next(); // Proceed to the actual endpoint
+    });
+}
+
+// --- PUBLIC ROUTES (No token required) ---
 
 // 1. Health Check
 app.get('/api/status', async (req, res) => {
@@ -41,25 +59,18 @@ app.post('/api/register', async (req, res) => {
     }
 });
 
-// NEW: 3. User Login & Token Generation
+// 3. User Login
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
-        
-        // Find the user
         const user = await prisma.user.findUnique({ where: { email } });
+        
         if (!user) return res.status(404).json({ error: 'User not found' });
 
-        // Verify the password using bcrypt
         const isPasswordValid = await bcrypt.compare(password, user.passwordHash);
         if (!isPasswordValid) return res.status(401).json({ error: 'Invalid credentials' });
 
-        // Generate the JWT key (valid for 1 hour)
-        const token = jwt.sign(
-            { userId: user.id, email: user.email }, 
-            process.env.JWT_SECRET, 
-            { expiresIn: '1h' }
-        );
+        const token = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '1h' });
 
         res.json({ status: 'Success', message: 'Login successful', token });
     } catch (error) {
@@ -67,23 +78,24 @@ app.post('/api/login', async (req, res) => {
     }
 });
 
+// --- PROTECTED ROUTES (Token Required) ---
+
 // 4. Process Deposit
-app.post('/api/deposit', async (req, res) => {
+app.post('/api/deposit', authenticateToken, async (req, res) => {
     try {
-        const { email, amount, assetSymbol } = req.body;
-        const user = await prisma.user.findUnique({ where: { email } });
+        const { amount, assetSymbol } = req.body;
+        const userId = req.user.userId; // Identity pulled safely from the token
         
-        if (!user) return res.status(404).json({ error: 'User not found' });
         if (amount <= 0) return res.status(400).json({ error: 'Deposit amount must be greater than zero' });
 
         const result = await prisma.$transaction([
             prisma.transaction.create({
-                data: { userId: user.id, transactionType: 'DEPOSIT', assetSymbol, amount }
+                data: { userId, transactionType: 'DEPOSIT', assetSymbol, amount }
             }),
             prisma.portfolio.upsert({
-                where: { userId_assetSymbol: { userId: user.id, assetSymbol } },
+                where: { userId_assetSymbol: { userId, assetSymbol } },
                 update: { balance: { increment: amount } },
-                create: { userId: user.id, assetType: 'CRYPTO', assetSymbol, balance: amount }
+                create: { userId, assetType: 'CRYPTO', assetSymbol, balance: amount }
             })
         ]);
         res.json({ status: 'Success', updatedPortfolio: result[1] });
@@ -93,12 +105,12 @@ app.post('/api/deposit', async (req, res) => {
 });
 
 // 5. Process Withdrawal
-app.post('/api/withdraw', async (req, res) => {
+app.post('/api/withdraw', authenticateToken, async (req, res) => {
     try {
-        const { email, amount, assetSymbol } = req.body;
-        const user = await prisma.user.findUnique({ where: { email }, include: { portfolios: true } });
+        const { amount, assetSymbol } = req.body;
+        const userId = req.user.userId;
         
-        if (!user) return res.status(404).json({ error: 'User not found' });
+        const user = await prisma.user.findUnique({ where: { id: userId }, include: { portfolios: true } });
         if (amount <= 0) return res.status(400).json({ error: 'Amount must be greater than zero' });
 
         const portfolio = user.portfolios.find(p => p.assetSymbol === assetSymbol);
@@ -109,10 +121,10 @@ app.post('/api/withdraw', async (req, res) => {
 
         const result = await prisma.$transaction([
             prisma.transaction.create({
-                data: { userId: user.id, transactionType: 'WITHDRAWAL', assetSymbol, amount: -amount }
+                data: { userId, transactionType: 'WITHDRAWAL', assetSymbol, amount: -amount }
             }),
             prisma.portfolio.update({
-                where: { userId_assetSymbol: { userId: user.id, assetSymbol } },
+                where: { userId_assetSymbol: { userId, assetSymbol } },
                 data: { balance: { decrement: amount } }
             })
         ]);
@@ -123,9 +135,11 @@ app.post('/api/withdraw', async (req, res) => {
 });
 
 // 6. Internal Asset Swap
-app.post('/api/swap', async (req, res) => {
+app.post('/api/swap', authenticateToken, async (req, res) => {
     try {
-        const { email, fromAsset, toAsset, amountToSwap } = req.body;
+        const { fromAsset, toAsset, amountToSwap } = req.body;
+        const userId = req.user.userId;
+
         const MOCK_EXCHANGE_RATES = { 'KES_TO_SOL': 1 / 20000, 'SOL_TO_KES': 20000 };
         const rate = MOCK_EXCHANGE_RATES[`${fromAsset}_TO_${toAsset}`];
 
@@ -135,50 +149,47 @@ app.post('/api/swap', async (req, res) => {
         const amountToReceive = amountToSwap * rate;
 
         const swapResult = await prisma.$transaction(async (tx) => {
-            const user = await tx.user.findUnique({ where: { email }, include: { portfolios: true } });
-            if (!user) throw new Error('User not found');
-
+            const user = await tx.user.findUnique({ where: { id: userId }, include: { portfolios: true } });
+            
             const fromPortfolio = user.portfolios.find(p => p.assetSymbol === fromAsset);
             if (!fromPortfolio || fromPortfolio.balance < amountToSwap) {
                 throw new Error(`Insufficient ${fromAsset} balance for swap.`);
             }
 
             await tx.portfolio.update({
-                where: { userId_assetSymbol: { userId: user.id, assetSymbol: fromAsset } },
+                where: { userId_assetSymbol: { userId, assetSymbol: fromAsset } },
                 data: { balance: { decrement: amountToSwap } }
             });
             await tx.transaction.create({
-                data: { userId: user.id, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -amountToSwap }
+                data: { userId, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -amountToSwap }
             });
 
             const toPortfolio = await tx.portfolio.upsert({
-                where: { userId_assetSymbol: { userId: user.id, assetSymbol: toAsset } },
+                where: { userId_assetSymbol: { userId, assetSymbol: toAsset } },
                 update: { balance: { increment: amountToReceive } },
-                create: { userId: user.id, assetType: toAsset === 'SOL' ? 'CRYPTO' : 'FIAT', assetSymbol: toAsset, balance: amountToReceive }
+                create: { userId, assetType: toAsset === 'SOL' ? 'CRYPTO' : 'FIAT', assetSymbol: toAsset, balance: amountToReceive }
             });
             await tx.transaction.create({
-                data: { userId: user.id, transactionType: 'SWAP_IN', assetSymbol: toAsset, amount: amountToReceive }
+                data: { userId, transactionType: 'SWAP_IN', assetSymbol: toAsset, amount: amountToReceive }
             });
 
             return { toPortfolio, amountToReceive };
         }, { maxWait: 10000, timeout: 20000 });
 
-        res.json({ status: 'Success', message: `Swapped ${amountToSwap} ${fromAsset} for ${swapResult.amountToReceive} ${toAsset}.`, newBalance: swapResult.toPortfolio });
+        res.json({ status: 'Success', message: `Swapped ${amountToSwap} ${fromAsset}.`, newBalance: swapResult.toPortfolio });
     } catch (error) {
         res.status(400).json({ error: error.message || 'Swap failed.' });
     }
 });
 
 // 7. Fetch Full Dashboard
-app.get('/api/dashboard/:email', async (req, res) => {
+app.get('/api/dashboard', authenticateToken, async (req, res) => {
     try {
-        const { email } = req.params;
+        const userId = req.user.userId;
         const userDashboard = await prisma.user.findUnique({
-            where: { email },
+            where: { id: userId },
             include: { portfolios: true, transactions: { orderBy: { timestamp: 'desc' }, take: 10 } }
         });
-        
-        if (!userDashboard) return res.status(404).json({ error: 'User not found' });
         
         const { passwordHash, ...safeUserData } = userDashboard;
         res.json({ status: 'Success', data: safeUserData });
