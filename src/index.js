@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const { PrismaClient } = require('@prisma/client');
 const { PrismaPg } = require('@prisma/adapter-pg');
-const bcrypt = require('bcrypt'); // newly added
+const bcrypt = require('bcrypt');
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
@@ -26,15 +26,12 @@ app.get('/api/status', async (req, res) => {
     }
 });
 
-// User Registration & Zero-Baseline Enforcement
+// User Registration
 app.post('/api/register', async (req, res) => {
     try {
         const { email, password } = req.body;
-
-        // 1. Hash the password for security
         const hashedPassword = await bcrypt.hash(password, 10);
 
-        // 2. Create the user AND an empty KES portfolio at the exact same time
         const user = await prisma.user.create({
             data: {
                 email: email,
@@ -43,30 +40,69 @@ app.post('/api/register', async (req, res) => {
                     create: {
                         assetType: 'FIAT',
                         assetSymbol: 'KES', 
-                        balance: 0.0 // Enforcing the absolute zero baseline
+                        balance: 0.0
                     }
                 }
             },
-            include: {
-                portfolios: true // This tells Prisma to return the newly created portfolio in the response
-            }
+            include: { portfolios: true }
         });
 
-        // 3. Send success response (never send the password hash back to the user)
         res.json({
             status: 'Success',
             message: 'User registered with a strictly zeroed portfolio.',
-            user: {
-                id: user.id,
-                email: user.email,
-                portfolio: user.portfolios
-            }
+            user: { id: user.id, email: user.email, portfolio: user.portfolios }
+        });
+    } catch (error) {
+        console.error("Registration failed:", error);
+        res.status(400).json({ error: 'Registration failed. Email might already exist.' });
+    }
+});
+
+// NEW: The Transaction Engine - Processing Deposits
+app.post('/api/deposit', async (req, res) => {
+    try {
+        const { email, amount, assetSymbol } = req.body;
+
+        // 1. Find the user by their email
+        const user = await prisma.user.findUnique({ where: { email } });
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        // 2. Ensure the amount is a positive deposit
+        if (amount <= 0) return res.status(400).json({ error: 'Deposit amount must be greater than zero' });
+
+        // 3. Execute an Atomic Transaction: Create ledger entry AND update balance together
+        const result = await prisma.$transaction([
+            prisma.transaction.create({
+                data: {
+                    userId: user.id,
+                    transactionType: 'DEPOSIT',
+                    assetSymbol: assetSymbol,
+                    amount: amount
+                }
+            }),
+            prisma.portfolio.update({
+                where: {
+                    userId_assetSymbol: {
+                        userId: user.id,
+                        assetSymbol: assetSymbol
+                    }
+                },
+                data: {
+                    balance: { increment: amount } // Safely adds to the existing balance
+                }
+            })
+        ]);
+
+        res.json({
+            status: 'Success',
+            message: `Successfully deposited ${amount} ${assetSymbol}.`,
+            transactionRecord: result[0],
+            updatedPortfolio: result[1]
         });
 
     } catch (error) {
-        console.error("Registration failed:", error);
-        // If the email is already taken, Prisma will throw an error
-        res.status(400).json({ error: 'Registration failed. Email might already exist.' });
+        console.error("Deposit failed:", error);
+        res.status(500).json({ error: 'Transaction failed. Ensure the portfolio exists.' });
     }
 });
 
