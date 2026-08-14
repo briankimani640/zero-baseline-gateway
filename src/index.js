@@ -10,23 +10,17 @@ const app = express();
 
 app.use(express.json());
 
-// Health Check Endpoint
+// 1. Health Check
 app.get('/api/status', async (req, res) => {
     try {
         const userCount = await prisma.user.count();
-        res.json({
-            status: 'Success',
-            message: 'Zero-Baseline Gateway is online.',
-            databaseConnected: true,
-            totalUsers: userCount
-        });
+        res.json({ status: 'Success', databaseConnected: true, totalUsers: userCount });
     } catch (error) {
-        console.error("Database connection failed:", error);
         res.status(500).json({ error: 'Failed to connect to the database.' });
     }
 });
 
-// User Registration
+// 2. User Registration
 app.post('/api/register', async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -37,72 +31,73 @@ app.post('/api/register', async (req, res) => {
                 email: email,
                 passwordHash: hashedPassword,
                 portfolios: {
-                    create: {
-                        assetType: 'FIAT',
-                        assetSymbol: 'KES', 
-                        balance: 0.0
-                    }
+                    create: { assetType: 'FIAT', assetSymbol: 'KES', balance: 0.0 }
                 }
             },
             include: { portfolios: true }
         });
 
-        res.json({
-            status: 'Success',
-            message: 'User registered with a strictly zeroed portfolio.',
-            user: { id: user.id, email: user.email, portfolio: user.portfolios }
-        });
+        res.json({ status: 'Success', user: { id: user.id, email: user.email, portfolio: user.portfolios } });
     } catch (error) {
-        console.error("Registration failed:", error);
         res.status(400).json({ error: 'Registration failed. Email might already exist.' });
     }
 });
 
-// NEW: The Transaction Engine - Processing Deposits
+// 3. Process Deposit
 app.post('/api/deposit', async (req, res) => {
     try {
         const { email, amount, assetSymbol } = req.body;
-
-        // 1. Find the user by their email
         const user = await prisma.user.findUnique({ where: { email } });
+        
         if (!user) return res.status(404).json({ error: 'User not found' });
-
-        // 2. Ensure the amount is a positive deposit
         if (amount <= 0) return res.status(400).json({ error: 'Deposit amount must be greater than zero' });
 
-        // 3. Execute an Atomic Transaction: Create ledger entry AND update balance together
         const result = await prisma.$transaction([
             prisma.transaction.create({
-                data: {
-                    userId: user.id,
-                    transactionType: 'DEPOSIT',
-                    assetSymbol: assetSymbol,
-                    amount: amount
-                }
+                data: { userId: user.id, transactionType: 'DEPOSIT', assetSymbol: assetSymbol, amount: amount }
             }),
             prisma.portfolio.update({
-                where: {
-                    userId_assetSymbol: {
-                        userId: user.id,
-                        assetSymbol: assetSymbol
-                    }
-                },
-                data: {
-                    balance: { increment: amount } // Safely adds to the existing balance
-                }
+                where: { userId_assetSymbol: { userId: user.id, assetSymbol: assetSymbol } },
+                data: { balance: { increment: amount } }
             })
         ]);
 
+        res.json({ status: 'Success', updatedPortfolio: result[1] });
+    } catch (error) {
+        res.status(500).json({ error: 'Transaction failed.' });
+    }
+});
+
+// NEW 4. Fetch Full Dashboard
+app.get('/api/dashboard/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+
+        // Fetch user, their portfolios, and their 10 most recent transactions
+        const userDashboard = await prisma.user.findUnique({
+            where: { email },
+            include: {
+                portfolios: true,
+                transactions: {
+                    orderBy: { timestamp: 'desc' },
+                    take: 10
+                }
+            }
+        });
+
+        if (!userDashboard) return res.status(404).json({ error: 'User not found' });
+
+        // Strip out the password hash before sending data back
+        const { passwordHash, ...safeUserData } = userDashboard;
+
         res.json({
             status: 'Success',
-            message: `Successfully deposited ${amount} ${assetSymbol}.`,
-            transactionRecord: result[0],
-            updatedPortfolio: result[1]
+            data: safeUserData
         });
 
     } catch (error) {
-        console.error("Deposit failed:", error);
-        res.status(500).json({ error: 'Transaction failed. Ensure the portfolio exists.' });
+        console.error("Dashboard fetch failed:", error);
+        res.status(500).json({ error: 'Failed to retrieve dashboard data.' });
     }
 });
 
