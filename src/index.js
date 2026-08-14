@@ -68,35 +68,63 @@ app.post('/api/deposit', async (req, res) => {
     }
 });
 
-// NEW 4. Fetch Full Dashboard
+// NEW: 4. Process Withdrawal (Strict Bounds Checking)
+app.post('/api/withdraw', async (req, res) => {
+    try {
+        const { email, amount, assetSymbol } = req.body;
+        
+        // Include the specific portfolio so we can check the balance
+        const user = await prisma.user.findUnique({ 
+            where: { email },
+            include: { portfolios: true } 
+        });
+        
+        if (!user) return res.status(404).json({ error: 'User not found' });
+        if (amount <= 0) return res.status(400).json({ error: 'Withdrawal amount must be greater than zero' });
+
+        // Find the specific asset wallet
+        const portfolio = user.portfolios.find(p => p.assetSymbol === assetSymbol);
+        if (!portfolio) return res.status(404).json({ error: `Portfolio for ${assetSymbol} not found.` });
+
+        // THE BOUNDARY CHECK: Prevent going below zero
+        if (portfolio.balance < amount) {
+            return res.status(400).json({ 
+                error: 'Insufficient funds. Strict zero-baseline enforced.',
+                currentBalance: portfolio.balance
+            });
+        }
+
+        // Execute withdrawal (logging a negative amount in the transaction ledger)
+        const result = await prisma.$transaction([
+            prisma.transaction.create({
+                data: { userId: user.id, transactionType: 'WITHDRAWAL', assetSymbol: assetSymbol, amount: -amount }
+            }),
+            prisma.portfolio.update({
+                where: { userId_assetSymbol: { userId: user.id, assetSymbol: assetSymbol } },
+                data: { balance: { decrement: amount } }
+            })
+        ]);
+
+        res.json({ status: 'Success', message: `Successfully withdrew ${amount} ${assetSymbol}.`, updatedPortfolio: result[1] });
+    } catch (error) {
+        res.status(500).json({ error: 'Transaction failed.' });
+    }
+});
+
+// 5. Fetch Full Dashboard
 app.get('/api/dashboard/:email', async (req, res) => {
     try {
         const { email } = req.params;
-
-        // Fetch user, their portfolios, and their 10 most recent transactions
         const userDashboard = await prisma.user.findUnique({
             where: { email },
-            include: {
-                portfolios: true,
-                transactions: {
-                    orderBy: { timestamp: 'desc' },
-                    take: 10
-                }
-            }
+            include: { portfolios: true, transactions: { orderBy: { timestamp: 'desc' }, take: 10 } }
         });
 
         if (!userDashboard) return res.status(404).json({ error: 'User not found' });
 
-        // Strip out the password hash before sending data back
         const { passwordHash, ...safeUserData } = userDashboard;
-
-        res.json({
-            status: 'Success',
-            data: safeUserData
-        });
-
+        res.json({ status: 'Success', data: safeUserData });
     } catch (error) {
-        console.error("Dashboard fetch failed:", error);
         res.status(500).json({ error: 'Failed to retrieve dashboard data.' });
     }
 });
