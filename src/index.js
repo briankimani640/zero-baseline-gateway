@@ -4,11 +4,16 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const { PrismaClient } = require('@prisma/client');
+const { PrismaPg } = require('@prisma/adapter-pg');
+const { Pool } = require('pg');
 
-// Initialize App & Database Connection
+// Initialize Prisma 7 Database Connection Adapter
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg(pool);
+const prisma = new PrismaClient({ adapter });
+
+// Initialize App
 const app = express();
-const prisma = new PrismaClient();
-
 app.use(cors());
 app.use(express.json());
 
@@ -30,7 +35,7 @@ function authenticateToken(req, res, next) {
 
 // --- API ENDPOINTS ---
 
-// 1. NEW: Account Initialization (Registration)
+// 1. Account Initialization (Registration)
 app.post('/api/register', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -39,16 +44,13 @@ app.post('/api/register', async (req, res) => {
       return res.status(400).json({ error: 'Email and password are required.' });
     }
 
-    // Check if user already exists
     const existingUser = await prisma.user.findUnique({ where: { email } });
     if (existingUser) {
       return res.status(400).json({ error: 'An account with this email already exists.' });
     }
 
-    // Hash the password securely
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Create the user AND their default zero-baseline portfolios simultaneously
     const newUser = await prisma.user.create({
       data: {
         email,
@@ -69,20 +71,17 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// 2. UPDATED: Real Database Login
+// 2. Real Database Login
 app.post('/api/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
-    // Find the user in PostgreSQL
     const user = await prisma.user.findUnique({ where: { email } });
     if (!user) return res.status(400).json({ error: 'Invalid credentials' });
 
-    // Compare the provided password with the stored hash
     const validPassword = await bcrypt.compare(password, user.passwordHash);
     if (!validPassword) return res.status(400).json({ error: 'Invalid credentials' });
 
-    // Generate Token containing the user's secure database ID
     const token = jwt.sign({ id: user.id, email: user.email }, SECRET_KEY, { expiresIn: '1h' });
     res.json({ status: 'Success', token: token });
   } catch (error) {
@@ -90,10 +89,9 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// 3. UPDATED: Real Database Dashboard
+// 3. Real Database Dashboard
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
-    // Fetch the user and their associated portfolios from the database
     const user = await prisma.user.findUnique({
       where: { id: req.user.id },
       include: { portfolios: true }
@@ -101,7 +99,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
 
     if (!user) return res.status(404).json({ error: 'User data not found.' });
 
-    // Send the real data back to the mobile app
     res.json({ 
       status: 'Success', 
       data: { email: user.email, portfolios: user.portfolios } 
@@ -111,19 +108,89 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
-// 4. Transfer Endpoint (Wiring pending next step)
+// 4. Secure Deposit Endpoint (To fund the baseline)
+app.post('/api/deposit', authenticateToken, async (req, res) => {
+  try {
+    const { assetSymbol, amount } = req.body;
+    const parsedAmount = parseFloat(amount);
+
+    if (!assetSymbol || isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: 'Valid asset symbol and amount required.' });
+    }
+
+    await prisma.portfolio.update({
+      where: { 
+        userId_assetSymbol: { userId: req.user.id, assetSymbol: assetSymbol } 
+      },
+      data: { balance: { increment: parsedAmount } }
+    });
+
+    // Log the transaction
+    await prisma.transaction.create({
+      data: {
+        userId: req.user.id,
+        transactionType: 'DEPOSIT',
+        assetSymbol: assetSymbol,
+        amount: parsedAmount,
+        reference: 'SYSTEM_FUNDING'
+      }
+    });
+
+    res.json({ status: 'Success', message: `Successfully deposited ${parsedAmount} ${assetSymbol}.` });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to process deposit.' });
+  }
+});
+
+// 5. ACID-Compliant Transfer Engine
 app.post('/api/transfer', authenticateToken, async (req, res) => {
   try {
-    const { recipient, amount } = req.body;
-    const sender = req.user.email;
+    const { recipient, amount, assetSymbol = 'KES' } = req.body;
+    const senderId = req.user.id;
+    const parsedAmount = parseFloat(amount);
 
-    if (!recipient || !amount) return res.status(400).json({ error: 'Recipient and amount required.' });
+    if (!recipient || isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: 'Valid recipient and amount required.' });
+    }
 
-    console.log(`[PENDING TRANSACTION] ${sender} requesting transfer of ${amount} to ${recipient}`);
+    const recipientUser = await prisma.user.findUnique({ where: { email: recipient } });
+    if (!recipientUser) return res.status(404).json({ error: 'Recipient account not found.' });
 
-    res.json({ status: 'Success', message: `Transfer request received for ${amount} to ${recipient}.` });
+    // Execute Prisma Transaction (All or Nothing)
+    await prisma.$transaction(async (tx) => {
+      const senderPortfolio = await tx.portfolio.findUnique({
+        where: { userId_assetSymbol: { userId: senderId, assetSymbol: assetSymbol } }
+      });
+
+      if (!senderPortfolio || senderPortfolio.balance < parsedAmount) {
+        throw new Error('Insufficient funds in the selected portfolio.');
+      }
+
+      // Deduct from sender
+      await tx.portfolio.update({
+        where: { userId_assetSymbol: { userId: senderId, assetSymbol: assetSymbol } },
+        data: { balance: { decrement: parsedAmount } }
+      });
+
+      // Add to recipient (Creates the wallet if they don't hold this asset yet)
+      await tx.portfolio.upsert({
+        where: { userId_assetSymbol: { userId: recipientUser.id, assetSymbol: assetSymbol } },
+        update: { balance: { increment: parsedAmount } },
+        create: { userId: recipientUser.id, assetType: 'FIAT', assetSymbol: assetSymbol, balance: parsedAmount }
+      });
+
+      // Write Immutable Ledger Records
+      await tx.transaction.create({
+        data: { userId: senderId, transactionType: 'TRANSFER_OUT', assetSymbol: assetSymbol, amount: -parsedAmount, reference: recipientUser.email }
+      });
+      await tx.transaction.create({
+        data: { userId: recipientUser.id, transactionType: 'TRANSFER_IN', assetSymbol: assetSymbol, amount: parsedAmount, reference: req.user.email }
+      });
+    });
+
+    res.json({ status: 'Success', message: `Transferred ${parsedAmount} ${assetSymbol} to ${recipient}.` });
   } catch (error) {
-    res.status(500).json({ error: 'Transaction failed.' });
+    res.status(400).json({ error: error.message || 'Transaction failed.' });
   }
 });
 
