@@ -20,14 +20,17 @@ const SECRET_KEY = process.env.JWT_SECRET || 'YOUR_SECRET_KEY';
 // --- LIVE MARKET ORACLE ---
 async function getLiveSolKesRate() {
   try {
-    const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=kes');
+    // UPDATED: Added User-Agent header to mimic a browser
+    const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=kes', {
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
     const data = await response.json();
     if (data && data.solana && data.solana.kes) {
       return data.solana.kes; // Returns the exact live market rate
     }
     throw new Error("Invalid API response format");
   } catch (error) {
-    console.error("Market API degraded. Falling back to fail-safe rate.");
+    console.error("Market API degraded or blocked. Falling back to fail-safe rate.");
     return 20000; // Fail-safe hardcoded rate
   }
 }
@@ -126,7 +129,6 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Dedicated Market Rate Endpoint
 app.get('/api/rates', authenticateToken, async (req, res) => {
   try {
     const liveRate = await getLiveSolKesRate();
@@ -235,7 +237,6 @@ app.post('/api/swap', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Valid assets and amount required.' });
     }
 
-    // SWAP ENGINE UPGRADE: Now uses live market data
     const EXCHANGE_RATE = await getLiveSolKesRate(); 
     let convertedAmount = 0;
 
