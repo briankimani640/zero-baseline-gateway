@@ -130,7 +130,6 @@ app.post('/api/deposit', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Withdrawal Engine
 app.post('/api/withdraw', authenticateToken, async (req, res) => {
   try {
     const { assetSymbol, amount } = req.body;
@@ -206,6 +205,71 @@ app.post('/api/transfer', authenticateToken, async (req, res) => {
   }
 });
 
+// NEW: Asset Swap Engine
+app.post('/api/swap', authenticateToken, async (req, res) => {
+  try {
+    const { fromAsset, toAsset, amount } = req.body;
+    const parsedAmount = parseFloat(amount);
+
+    if (!fromAsset || !toAsset || isNaN(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ error: 'Valid assets and amount required.' });
+    }
+
+    // Hardcoded market exchange rate
+    const EXCHANGE_RATE = 20000; 
+    let convertedAmount = 0;
+
+    if (fromAsset === 'KES' && toAsset === 'SOL') {
+      convertedAmount = parsedAmount / EXCHANGE_RATE;
+    } else if (fromAsset === 'SOL' && toAsset === 'KES') {
+      convertedAmount = parsedAmount * EXCHANGE_RATE;
+    } else {
+      return res.status(400).json({ error: 'Unsupported trading pair.' });
+    }
+
+    await prisma.$transaction(async (tx) => {
+      const senderPortfolio = await tx.portfolio.findUnique({
+        where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: fromAsset } }
+      });
+
+      if (!senderPortfolio || senderPortfolio.balance < parsedAmount) {
+        throw new Error(`Insufficient ${fromAsset} balance for this swap.`);
+      }
+
+      // Deduct origin asset
+      await tx.portfolio.update({
+        where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: fromAsset } },
+        data: { balance: { decrement: parsedAmount } }
+      });
+
+      // Inject converted asset
+      await tx.portfolio.upsert({
+        where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: toAsset } },
+        update: { balance: { increment: convertedAmount } },
+        create: { 
+          userId: req.user.id, 
+          assetType: toAsset === 'SOL' ? 'CRYPTO' : 'FIAT', 
+          assetSymbol: toAsset, 
+          balance: convertedAmount 
+        }
+      });
+
+      // Write immutable dual-ledger receipts
+      await tx.transaction.create({
+        data: { userId: req.user.id, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -parsedAmount, reference: `Converted to ${toAsset}` }
+      });
+      await tx.transaction.create({
+        data: { userId: req.user.id, transactionType: 'SWAP_IN', assetSymbol: toAsset, amount: convertedAmount, reference: `Converted from ${fromAsset}` }
+      });
+    });
+
+    res.json({ status: 'Success', message: `Successfully swapped ${parsedAmount} ${fromAsset} for ${convertedAmount} ${toAsset}.` });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Swap failed.' });
+  }
+});
+
+// --- SERVER STARTUP ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running securely on http://localhost:${PORT}`);
