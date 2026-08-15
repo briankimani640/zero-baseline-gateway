@@ -17,6 +17,21 @@ app.use(express.json());
 
 const SECRET_KEY = process.env.JWT_SECRET || 'YOUR_SECRET_KEY';
 
+// --- LIVE MARKET ORACLE ---
+async function getLiveSolKesRate() {
+  try {
+    const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=kes');
+    const data = await response.json();
+    if (data && data.solana && data.solana.kes) {
+      return data.solana.kes; // Returns the exact live market rate
+    }
+    throw new Error("Invalid API response format");
+  } catch (error) {
+    console.error("Market API degraded. Falling back to fail-safe rate.");
+    return 20000; // Fail-safe hardcoded rate
+  }
+}
+
 // --- MIDDLEWARE ---
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -80,7 +95,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// UPDATED: Now includes the User Profile data in the fetch
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
@@ -88,14 +102,14 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       include: { 
         profile: true,
         portfolios: true,
-        transactions: {
-          orderBy: { timestamp: 'desc' },
-          take: 20 
-        }
+        transactions: { orderBy: { timestamp: 'desc' }, take: 20 }
       }
     });
 
     if (!user) return res.status(404).json({ error: 'User data not found.' });
+
+    // Inject the live market rate into the dashboard payload
+    const liveRate = await getLiveSolKesRate();
 
     res.json({ 
       status: 'Success', 
@@ -103,7 +117,8 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         email: user.email, 
         profile: user.profile,
         portfolios: user.portfolios,
-        transactions: user.transactions
+        transactions: user.transactions,
+        marketRate: liveRate 
       } 
     });
   } catch (error) {
@@ -111,17 +126,24 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Update Profile Endpoint
+// NEW: Dedicated Market Rate Endpoint
+app.get('/api/rates', authenticateToken, async (req, res) => {
+  try {
+    const liveRate = await getLiveSolKesRate();
+    res.json({ status: 'Success', rate: liveRate });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch market data.' });
+  }
+});
+
 app.post('/api/profile', authenticateToken, async (req, res) => {
   try {
     const { firstName, lastName, phoneNumber } = req.body;
-
     const profile = await prisma.profile.upsert({
       where: { userId: req.user.id },
       update: { firstName, lastName, phoneNumber },
       create: { userId: req.user.id, firstName, lastName, phoneNumber }
     });
-
     res.json({ status: 'Success', message: 'Profile synchronized successfully.', data: profile });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update profile.' });
@@ -132,7 +154,6 @@ app.post('/api/deposit', authenticateToken, async (req, res) => {
   try {
     const { assetSymbol, amount } = req.body;
     const parsedAmount = parseFloat(amount);
-
     if (!assetSymbol || isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Valid asset symbol and amount required.' });
 
     await prisma.portfolio.update({
@@ -143,43 +164,32 @@ app.post('/api/deposit', authenticateToken, async (req, res) => {
     await prisma.transaction.create({
       data: { userId: req.user.id, transactionType: 'DEPOSIT', assetSymbol: assetSymbol, amount: parsedAmount, reference: 'SYSTEM_FUNDING' }
     });
-
     res.json({ status: 'Success', message: `Successfully deposited ${parsedAmount} ${assetSymbol}.` });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to process deposit.' });
-  }
+  } catch (error) { res.status(500).json({ error: 'Failed to process deposit.' }); }
 });
 
 app.post('/api/withdraw', authenticateToken, async (req, res) => {
   try {
     const { assetSymbol, amount } = req.body;
     const parsedAmount = parseFloat(amount);
-
     if (!assetSymbol || isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Valid asset symbol and amount required.' });
 
     await prisma.$transaction(async (tx) => {
       const userPortfolio = await tx.portfolio.findUnique({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: assetSymbol } }
       });
-
-      if (!userPortfolio || userPortfolio.balance < parsedAmount) {
-        throw new Error('Insufficient funds for withdrawal.');
-      }
+      if (!userPortfolio || userPortfolio.balance < parsedAmount) throw new Error('Insufficient funds for withdrawal.');
 
       await tx.portfolio.update({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: assetSymbol } },
         data: { balance: { decrement: parsedAmount } }
       });
-
       await tx.transaction.create({
         data: { userId: req.user.id, transactionType: 'WITHDRAWAL', assetSymbol: assetSymbol, amount: -parsedAmount, reference: 'EXTERNAL_BANK' }
       });
     });
-
     res.json({ status: 'Success', message: `Successfully withdrew ${parsedAmount} ${assetSymbol}.` });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Withdrawal failed.' });
-  }
+  } catch (error) { res.status(400).json({ error: error.message || 'Withdrawal failed.' }); }
 });
 
 app.post('/api/transfer', authenticateToken, async (req, res) => {
@@ -197,32 +207,23 @@ app.post('/api/transfer', authenticateToken, async (req, res) => {
       const senderPortfolio = await tx.portfolio.findUnique({
         where: { userId_assetSymbol: { userId: senderId, assetSymbol: assetSymbol } }
       });
-
       if (!senderPortfolio || senderPortfolio.balance < parsedAmount) throw new Error('Insufficient funds in the selected portfolio.');
 
       await tx.portfolio.update({
         where: { userId_assetSymbol: { userId: senderId, assetSymbol: assetSymbol } },
         data: { balance: { decrement: parsedAmount } }
       });
-
       await tx.portfolio.upsert({
         where: { userId_assetSymbol: { userId: recipientUser.id, assetSymbol: assetSymbol } },
         update: { balance: { increment: parsedAmount } },
         create: { userId: recipientUser.id, assetType: 'FIAT', assetSymbol: assetSymbol, balance: parsedAmount }
       });
 
-      await tx.transaction.create({
-        data: { userId: senderId, transactionType: 'TRANSFER_OUT', assetSymbol: assetSymbol, amount: -parsedAmount, reference: recipientUser.email }
-      });
-      await tx.transaction.create({
-        data: { userId: recipientUser.id, transactionType: 'TRANSFER_IN', assetSymbol: assetSymbol, amount: parsedAmount, reference: req.user.email }
-      });
+      await tx.transaction.create({ data: { userId: senderId, transactionType: 'TRANSFER_OUT', assetSymbol: assetSymbol, amount: -parsedAmount, reference: recipientUser.email } });
+      await tx.transaction.create({ data: { userId: recipientUser.id, transactionType: 'TRANSFER_IN', assetSymbol: assetSymbol, amount: parsedAmount, reference: req.user.email } });
     });
-
     res.json({ status: 'Success', message: `Transferred ${parsedAmount} ${assetSymbol} to ${recipient}.` });
-  } catch (error) {
-    res.status(400).json({ error: error.message || 'Transaction failed.' });
-  }
+  } catch (error) { res.status(400).json({ error: error.message || 'Transaction failed.' }); }
 });
 
 app.post('/api/swap', authenticateToken, async (req, res) => {
@@ -234,7 +235,8 @@ app.post('/api/swap', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Valid assets and amount required.' });
     }
 
-    const EXCHANGE_RATE = 20000; 
+    // SWAP ENGINE UPGRADE: Now uses live market data
+    const EXCHANGE_RATE = await getLiveSolKesRate(); 
     let convertedAmount = 0;
 
     if (fromAsset === 'KES' && toAsset === 'SOL') convertedAmount = parsedAmount / EXCHANGE_RATE;
@@ -245,31 +247,23 @@ app.post('/api/swap', authenticateToken, async (req, res) => {
       const senderPortfolio = await tx.portfolio.findUnique({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: fromAsset } }
       });
-
-      if (!senderPortfolio || senderPortfolio.balance < parsedAmount) {
-        throw new Error(`Insufficient ${fromAsset} balance for this swap.`);
-      }
+      if (!senderPortfolio || senderPortfolio.balance < parsedAmount) throw new Error(`Insufficient ${fromAsset} balance for this swap.`);
 
       await tx.portfolio.update({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: fromAsset } },
         data: { balance: { decrement: parsedAmount } }
       });
-
       await tx.portfolio.upsert({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: toAsset } },
         update: { balance: { increment: convertedAmount } },
         create: { userId: req.user.id, assetType: toAsset === 'SOL' ? 'CRYPTO' : 'FIAT', assetSymbol: toAsset, balance: convertedAmount }
       });
 
-      await tx.transaction.create({
-        data: { userId: req.user.id, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -parsedAmount, reference: `Converted to ${toAsset}` }
-      });
-      await tx.transaction.create({
-        data: { userId: req.user.id, transactionType: 'SWAP_IN', assetSymbol: toAsset, amount: convertedAmount, reference: `Converted from ${fromAsset}` }
-      });
+      await tx.transaction.create({ data: { userId: req.user.id, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -parsedAmount, reference: `Converted @ ${EXCHANGE_RATE.toLocaleString()} KES` } });
+      await tx.transaction.create({ data: { userId: req.user.id, transactionType: 'SWAP_IN', assetSymbol: toAsset, amount: convertedAmount, reference: `Converted @ ${EXCHANGE_RATE.toLocaleString()} KES` } });
     });
 
-    res.json({ status: 'Success', message: `Successfully swapped ${parsedAmount} ${fromAsset} for ${convertedAmount} ${toAsset}.` });
+    res.json({ status: 'Success', message: `Successfully swapped ${parsedAmount} ${fromAsset} for ${convertedAmount.toFixed(4)} ${toAsset}.` });
   } catch (error) {
     res.status(400).json({ error: error.message || 'Swap failed.' });
   }
