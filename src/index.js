@@ -80,7 +80,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// UPDATED: Now fetches transactions ordered by newest first
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
@@ -89,7 +88,7 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
         portfolios: true,
         transactions: {
           orderBy: { timestamp: 'desc' },
-          take: 20 // Let's limit to the 20 most recent records to keep the payload light
+          take: 20 
         }
       }
     });
@@ -128,6 +127,39 @@ app.post('/api/deposit', authenticateToken, async (req, res) => {
     res.json({ status: 'Success', message: `Successfully deposited ${parsedAmount} ${assetSymbol}.` });
   } catch (error) {
     res.status(500).json({ error: 'Failed to process deposit.' });
+  }
+});
+
+// NEW: Withdrawal Engine
+app.post('/api/withdraw', authenticateToken, async (req, res) => {
+  try {
+    const { assetSymbol, amount } = req.body;
+    const parsedAmount = parseFloat(amount);
+
+    if (!assetSymbol || isNaN(parsedAmount) || parsedAmount <= 0) return res.status(400).json({ error: 'Valid asset symbol and amount required.' });
+
+    await prisma.$transaction(async (tx) => {
+      const userPortfolio = await tx.portfolio.findUnique({
+        where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: assetSymbol } }
+      });
+
+      if (!userPortfolio || userPortfolio.balance < parsedAmount) {
+        throw new Error('Insufficient funds for withdrawal.');
+      }
+
+      await tx.portfolio.update({
+        where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: assetSymbol } },
+        data: { balance: { decrement: parsedAmount } }
+      });
+
+      await tx.transaction.create({
+        data: { userId: req.user.id, transactionType: 'WITHDRAWAL', assetSymbol: assetSymbol, amount: -parsedAmount, reference: 'EXTERNAL_BANK' }
+      });
+    });
+
+    res.json({ status: 'Success', message: `Successfully withdrew ${parsedAmount} ${assetSymbol}.` });
+  } catch (error) {
+    res.status(400).json({ error: error.message || 'Withdrawal failed.' });
   }
 });
 
@@ -174,7 +206,6 @@ app.post('/api/transfer', authenticateToken, async (req, res) => {
   }
 });
 
-// --- SERVER STARTUP ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server is running securely on http://localhost:${PORT}`);
