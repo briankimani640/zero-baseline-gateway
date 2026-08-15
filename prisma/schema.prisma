@@ -22,10 +22,10 @@ model Portfolio {
   user        User     @relation(fields: [userId], references: [id])
   assetType   String   // e.g., "CRYPTO", "FIAT", "EQUITY"
   assetSymbol String   // e.g., "SOL", "KES", "USD"
-  balance     Float    @default(0.0) // This enforces the absolute zero baseline
+  balance     Float    @default(0.0) 
   updatedAt   DateTime @updatedAt
 
-  @@unique([userId, assetSymbol]) // Ensures one wallet/portfolio per asset type
+  @@unique([userId, assetSymbol]) 
 }
 
 model Transaction {
@@ -34,7 +34,7 @@ model Transaction {
   user            User     @relation(fields: [userId], references: [id])
   transactionType String   // e.g., "DEPOSIT", "WITHDRAWAL"
   assetSymbol     String   
-  amount          Float    // Positive for deposits, negative for withdrawals
-  reference       String?  // For transaction hashes or API receipts
+  amount          Float    
+  reference       String?  
   timestamp       DateTime @default(now())
 }
