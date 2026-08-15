@@ -80,11 +80,13 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// UPDATED: Now includes the User Profile data in the fetch
 app.get('/api/dashboard', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({
       where: { id: req.user.id },
       include: { 
+        profile: true,
         portfolios: true,
         transactions: {
           orderBy: { timestamp: 'desc' },
@@ -99,12 +101,30 @@ app.get('/api/dashboard', authenticateToken, async (req, res) => {
       status: 'Success', 
       data: { 
         email: user.email, 
+        profile: user.profile,
         portfolios: user.portfolios,
         transactions: user.transactions
       } 
     });
   } catch (error) {
     res.status(500).json({ error: 'Failed to retrieve ledger data.' });
+  }
+});
+
+// NEW: Update Profile Endpoint
+app.post('/api/profile', authenticateToken, async (req, res) => {
+  try {
+    const { firstName, lastName, phoneNumber } = req.body;
+
+    const profile = await prisma.profile.upsert({
+      where: { userId: req.user.id },
+      update: { firstName, lastName, phoneNumber },
+      create: { userId: req.user.id, firstName, lastName, phoneNumber }
+    });
+
+    res.json({ status: 'Success', message: 'Profile synchronized successfully.', data: profile });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to update profile.' });
   }
 });
 
@@ -205,7 +225,6 @@ app.post('/api/transfer', authenticateToken, async (req, res) => {
   }
 });
 
-// NEW: Asset Swap Engine
 app.post('/api/swap', authenticateToken, async (req, res) => {
   try {
     const { fromAsset, toAsset, amount } = req.body;
@@ -215,17 +234,12 @@ app.post('/api/swap', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Valid assets and amount required.' });
     }
 
-    // Hardcoded market exchange rate
     const EXCHANGE_RATE = 20000; 
     let convertedAmount = 0;
 
-    if (fromAsset === 'KES' && toAsset === 'SOL') {
-      convertedAmount = parsedAmount / EXCHANGE_RATE;
-    } else if (fromAsset === 'SOL' && toAsset === 'KES') {
-      convertedAmount = parsedAmount * EXCHANGE_RATE;
-    } else {
-      return res.status(400).json({ error: 'Unsupported trading pair.' });
-    }
+    if (fromAsset === 'KES' && toAsset === 'SOL') convertedAmount = parsedAmount / EXCHANGE_RATE;
+    else if (fromAsset === 'SOL' && toAsset === 'KES') convertedAmount = parsedAmount * EXCHANGE_RATE;
+    else return res.status(400).json({ error: 'Unsupported trading pair.' });
 
     await prisma.$transaction(async (tx) => {
       const senderPortfolio = await tx.portfolio.findUnique({
@@ -236,25 +250,17 @@ app.post('/api/swap', authenticateToken, async (req, res) => {
         throw new Error(`Insufficient ${fromAsset} balance for this swap.`);
       }
 
-      // Deduct origin asset
       await tx.portfolio.update({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: fromAsset } },
         data: { balance: { decrement: parsedAmount } }
       });
 
-      // Inject converted asset
       await tx.portfolio.upsert({
         where: { userId_assetSymbol: { userId: req.user.id, assetSymbol: toAsset } },
         update: { balance: { increment: convertedAmount } },
-        create: { 
-          userId: req.user.id, 
-          assetType: toAsset === 'SOL' ? 'CRYPTO' : 'FIAT', 
-          assetSymbol: toAsset, 
-          balance: convertedAmount 
-        }
+        create: { userId: req.user.id, assetType: toAsset === 'SOL' ? 'CRYPTO' : 'FIAT', assetSymbol: toAsset, balance: convertedAmount }
       });
 
-      // Write immutable dual-ledger receipts
       await tx.transaction.create({
         data: { userId: req.user.id, transactionType: 'SWAP_OUT', assetSymbol: fromAsset, amount: -parsedAmount, reference: `Converted to ${toAsset}` }
       });

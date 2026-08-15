@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -12,29 +13,48 @@ model User {
   passwordHash String
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
+  
+  // New Relation: A user can have one profile
+  profile      Profile?      
+
   portfolios   Portfolio[]
   transactions Transaction[]
+}
+
+// NEW: The Profile Model
+model Profile {
+  id          String   @id @default(uuid())
+  userId      String   @unique
+  firstName   String?
+  lastName    String?
+  phoneNumber String?
+  avatarUrl   String?
+  updatedAt   DateTime @updatedAt
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 }
 
 model Portfolio {
   id          String   @id @default(uuid())
   userId      String
-  user        User     @relation(fields: [userId], references: [id])
-  assetType   String   // e.g., "CRYPTO", "FIAT", "EQUITY"
-  assetSymbol String   // e.g., "SOL", "KES", "USD"
-  balance     Float    @default(0.0) 
+  assetType   String   
+  assetSymbol String   
+  balance     Float    @default(0.0)
   updatedAt   DateTime @updatedAt
 
-  @@unique([userId, assetSymbol]) 
+  user        User     @relation(fields: [userId], references: [id])
+
+  @@unique([userId, assetSymbol])
 }
 
 model Transaction {
   id              String   @id @default(uuid())
   userId          String
-  user            User     @relation(fields: [userId], references: [id])
-  transactionType String   // e.g., "DEPOSIT", "WITHDRAWAL"
-  assetSymbol     String   
-  amount          Float    
-  reference       String?  
+  transactionType String   
+  assetSymbol     String
+  amount          Float
+  reference       String?
   timestamp       DateTime @default(now())
+
+  user            User     @relation(fields: [userId], references: [id])
 }
